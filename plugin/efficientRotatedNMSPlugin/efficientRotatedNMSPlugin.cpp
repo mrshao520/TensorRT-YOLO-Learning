@@ -29,6 +29,7 @@ char const* const kEFFICIENT_ROTATED_NMS_PLUGIN_VERSION{"1"};
 char const* const kEFFICIENT_ROTATED_NMS_PLUGIN_NAME{"EfficientRotatedNMS_TRT"};
 } // namespace
 
+/// @brief 静态注册插件创建器到注册表中
 REGISTER_TENSORRT_PLUGIN(EfficientRotatedNMSPluginCreator);
 
 EfficientRotatedNMSPlugin::EfficientRotatedNMSPlugin(EfficientRotatedNMSParameters param)
@@ -68,18 +69,21 @@ int32_t EfficientRotatedNMSPlugin::initialize() noexcept
 {
     if (!initialized)
     {
+        /// 根据 GPU 计算能力动态调整 numSelectedBoxes 预选检测框数量
         int32_t device;
+        /// 1. 查询设备属性
         CSC(cudaGetDevice(&device), STATUS_FAILURE);
         struct cudaDeviceProp properties;
         CSC(cudaGetDeviceProperties(&properties, device), STATUS_FAILURE);
+        /// 2. 根据寄存器数量动态配置参数
         if (properties.regsPerBlock >= 65536)
         {
-            // Most Devices
+            // Most Devices 桌面/服务器级
             mParam.numSelectedBoxes = 2000;
         }
         else
         {
-            // Jetson TX1/TX2
+            // Jetson TX1/TX2  嵌入式设备
             mParam.numSelectedBoxes = 1000;
         }
         initialized = true;
@@ -126,12 +130,18 @@ char const* EfficientRotatedNMSPlugin::getPluginNamespace() const noexcept
 nvinfer1::DataType EfficientRotatedNMSPlugin::getOutputDataType(
     int32_t index, nvinfer1::DataType const* inputTypes, int32_t nbInputs) const noexcept
 {
+    /// num_det = torch.randint(0, max_output_boxes, (batch_size, 1), dtype=torch.int32)
+    /// det_boxes = torch.randn(batch_size, max_output_boxes, 4)
+    /// det_scores = torch.randn(batch_size, max_output_boxes)
+    /// det_classes = torch.randint(0, num_classes, (batch_size, max_output_boxes), dtype=torch.int32)
+
     // On standard RotatedNMS, num_detections and detection_classes use integer outputs
     if (index == 0 || index == 3)
     {
         return nvinfer1::DataType::kINT32;
     }
     // All others should use the same datatype as the input
+    /// 其他输出与输入的类型一致
     return inputTypes[0];
 }
 
@@ -162,11 +172,13 @@ DimsExprs EfficientRotatedNMSPlugin::getOutputDimensions(
         // As the number of classes may not be static, numOutputBoxes must be a dynamic
         // expression. The corresponding parameter can not be set at this time, so the
         // value will be calculated again in configurePlugin() and the param overwritten.
+        /// 当启用 padOutputBoxesPerClass(按类别填充时) 时
+        /// 最终输出框数 = min(预设最大框数, 每类最大框数 x 总类别数)
         IDimensionExpr const* numOutputBoxes = exprBuilder.constant(mParam.numOutputBoxes);
         if (mParam.padOutputBoxesPerClass && mParam.numOutputBoxesPerClass > 0)
         {
             IDimensionExpr const* numOutputBoxesPerClass = exprBuilder.constant(mParam.numOutputBoxesPerClass);
-            IDimensionExpr const* numClasses = inputs[1].d[2];
+            IDimensionExpr const* numClasses = inputs[1].d[2]; ///< 从输入获取类别数
             numOutputBoxes = exprBuilder.operation(DimensionOperation::kMIN, *numOutputBoxes,
                 *exprBuilder.operation(DimensionOperation::kPROD, *numOutputBoxesPerClass, *numClasses));
         }
@@ -174,14 +186,14 @@ DimsExprs EfficientRotatedNMSPlugin::getOutputDimensions(
         // Standard RotatedNMS
         PLUGIN_ASSERT(outputIndex >= 0 && outputIndex <= 3);
 
-        // num_detections
+        // num_detections [batch_size, 1]
         if (outputIndex == 0)
         {
             out_dim.nbDims = 2;
-            out_dim.d[0] = inputs[0].d[0];
+            out_dim.d[0] = inputs[0].d[0]; ///< batch_size
             out_dim.d[1] = exprBuilder.constant(1);
         }
-        // detection_boxes
+        // detection_boxes [batch_size, numOutputBoxes, 5]
         else if (outputIndex == 1)
         {
             out_dim.nbDims = 3;
@@ -189,7 +201,7 @@ DimsExprs EfficientRotatedNMSPlugin::getOutputDimensions(
             out_dim.d[1] = numOutputBoxes;
             out_dim.d[2] = exprBuilder.constant(5);
         }
-        // detection_scores: outputIndex == 2
+        // detection_scores: outputIndex == 2  [batch_size, numOutputBoxes]
         // detection_classes: outputIndex == 3
         else if (outputIndex == 2 || outputIndex == 3)
         {
@@ -243,6 +255,7 @@ void EfficientRotatedNMSPlugin::configurePlugin(
 {
     try
     {
+        /// 1. 验证输入输出个数
         // Accepts two or three inputs
         // If two inputs: [0] boxes, [1] scores
         // If three inputs: [0] boxes, [1] scores, [2] anchors
@@ -310,6 +323,7 @@ void EfficientRotatedNMSPlugin::configurePlugin(
 size_t EfficientRotatedNMSPlugin::getWorkspaceSize(
     PluginTensorDesc const* inputs, int32_t nbInputs, PluginTensorDesc const* outputs, int32_t nbOutputs) const noexcept
 {
+    /// scores [batch_size, num_boxes, num_class]
     int32_t batchSize = inputs[1].dims.d[0];
     int32_t numScoreElements = inputs[1].dims.d[1] * inputs[1].dims.d[2];
     int32_t numClasses = inputs[1].dims.d[2];
@@ -321,20 +335,24 @@ int32_t EfficientRotatedNMSPlugin::enqueue(PluginTensorDesc const* inputDesc, Pl
 {
     try
     {
+        /// 1. 检查指针有效性
         PLUGIN_VALIDATE(inputDesc != nullptr && inputs != nullptr && outputs != nullptr && workspace != nullptr);
 
         mParam.batchSize = inputDesc[0].dims.d[0];
 
         // Standard RotatedNMS Operation
+        /// 2. 获取输入指针
         void const* const boxesInput = inputs[0];
         void const* const scoresInput = inputs[1];
         void const* const anchorsInput = mParam.boxDecoder ? inputs[2] : nullptr;
 
+        /// 3. 获取输出指针
         void* numDetectionsOutput = outputs[0];
         void* nmsBoxesOutput = outputs[1];
         void* nmsScoresOutput = outputs[2];
         void* nmsClassesOutput = outputs[3];
 
+        /// 4. 推理
         return EfficientRotatedNMSInference(mParam, boxesInput, scoresInput, anchorsInput, numDetectionsOutput, nmsBoxesOutput,
             nmsScoresOutput, nmsClassesOutput, workspace, stream);
     }
@@ -351,6 +369,7 @@ EfficientRotatedNMSPluginCreator::EfficientRotatedNMSPluginCreator()
     : mParam{}
 {
     mPluginAttributes.clear();
+    /// 定义插件支持的参数列表
     mPluginAttributes.emplace_back(PluginField("score_threshold", nullptr, PluginFieldType::kFLOAT32, 1));
     mPluginAttributes.emplace_back(PluginField("iou_threshold", nullptr, PluginFieldType::kFLOAT32, 1));
     mPluginAttributes.emplace_back(PluginField("max_output_boxes", nullptr, PluginFieldType::kINT32, 1));
@@ -358,6 +377,7 @@ EfficientRotatedNMSPluginCreator::EfficientRotatedNMSPluginCreator()
     mPluginAttributes.emplace_back(PluginField("score_activation", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("class_agnostic", nullptr, PluginFieldType::kINT32, 1));
     mPluginAttributes.emplace_back(PluginField("box_coding", nullptr, PluginFieldType::kINT32, 1));
+    /// 将参数列表包装为 TensorRT 标准格式
     mFC.nbFields = mPluginAttributes.size();
     mFC.fields = mPluginAttributes.data();
 }
@@ -381,20 +401,27 @@ IPluginV2DynamicExt* EfficientRotatedNMSPluginCreator::createPlugin(char const* 
 {
     try
     {
+        /// 1. 参数有效性验证
         PLUGIN_VALIDATE(fc != nullptr);
         PluginField const* fields = fc->fields;
         PLUGIN_VALIDATE(fields != nullptr);
+
+        /// 2. 必要参数存在性检查
         plugin::validateRequiredAttributesExist({"score_threshold", "iou_threshold", "max_output_boxes",
                                                     "background_class", "score_activation", "box_coding"},
             fc);
+
+        /// 3. 参数解析与类型验证
         for (int32_t i{0}; i < fc->nbFields; ++i)
         {
             char const* attrName = fields[i].name;
             if (!strcmp(attrName, "score_threshold"))
             {
+                /// 4. 验证类型+范围
                 PLUGIN_VALIDATE(fields[i].type == PluginFieldType::kFLOAT32);
                 auto const scoreThreshold = *(static_cast<float const*>(fields[i].data));
                 PLUGIN_VALIDATE(scoreThreshold >= 0.0F);
+                /// 5. 填充 mParam
                 mParam.scoreThreshold = scoreThreshold;
             }
             if (!strcmp(attrName, "iou_threshold"))
@@ -437,6 +464,7 @@ IPluginV2DynamicExt* EfficientRotatedNMSPluginCreator::createPlugin(char const* 
             }
         }
 
+        /// 6. 创建插件实例
         auto* plugin = new EfficientRotatedNMSPlugin(mParam);
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
@@ -455,7 +483,9 @@ IPluginV2DynamicExt* EfficientRotatedNMSPluginCreator::deserializePlugin(
     {
         // This object will be deleted when the network is destroyed, which will
         // call EfficientNMSPlugin::destroy()
+        /// 1. 动态内存分配
         auto* plugin = new EfficientRotatedNMSPlugin(serialData, serialLength);
+        /// 2. 设置命名空间
         plugin->setPluginNamespace(mNamespace.c_str());
         return plugin;
     }

@@ -344,16 +344,19 @@ __global__ void EfficientRotatedNMSFilter(EfficientRotatedNMSParameters param, c
     int* __restrict__ topNumData, int* __restrict__ topIndexData, int* __restrict__ topAnchorsData,
     T* __restrict__ topScoresData, int* __restrict__ topClassData)
 {
+    /// 候选框元素索引
     int elementIdx = blockDim.x * blockIdx.x + threadIdx.x;
+    /// 图像批次索引
     int imageIdx = blockDim.y * blockIdx.y + threadIdx.y;
 
-    // Boundary Conditions
+    // Boundary Conditions 边界检查
     if (elementIdx >= param.numScoreElements || imageIdx >= param.batchSize)
     {
         return;
     }
 
     // Shape of scoresInput: [batchSize, numAnchors, numClasses]
+    /// 获取 num_classes 索引
     int scoresInputIdx = imageIdx * param.numScoreElements + elementIdx;
 
     // For each class, check its corresponding score if it crosses the threshold, and if so select this anchor,
@@ -362,21 +365,23 @@ __global__ void EfficientRotatedNMSFilter(EfficientRotatedNMSParameters param, c
     if (gte_mp(score, (T) param.scoreThreshold))
     {
         // Unpack the class and anchor index from the element index
-        int classIdx = elementIdx % param.numClasses;
-        int anchorIdx = elementIdx / param.numClasses;
+        int classIdx = elementIdx % param.numClasses;  ///< 类别索引
+        int anchorIdx = elementIdx / param.numClasses; ///< 目标框索引
 
-        // If this is a background class, ignore it.
+        // If this is a background class, ignore it. 背景过滤
         if (classIdx == param.backgroundClass)
         {
             return;
         }
 
         // Use an atomic to find an open slot where to write the selected anchor data.
+        /// 预检查：避免已满图像的无效原子操作
         if (topNumData[imageIdx] >= param.numScoreElements)
         {
             return;
         }
         int selectedIdx = atomicAdd((unsigned int*) &topNumData[imageIdx], 1);
+        /// 后检查：确保写入位置不越界
         if (selectedIdx >= param.numScoreElements)
         {
             topNumData[imageIdx] = param.numScoreElements;
@@ -386,6 +391,7 @@ __global__ void EfficientRotatedNMSFilter(EfficientRotatedNMSParameters param, c
         // Shape of topScoresData / topClassData: [batchSize, numScoreElements]
         int topIdx = imageIdx * param.numScoreElements + selectedIdx;
 
+        /// 为后续的浮点数位排序做准备
         if (param.scoreBits > 0)
         {
             score = add_mp(score, (T) 1);
@@ -396,10 +402,10 @@ __global__ void EfficientRotatedNMSFilter(EfficientRotatedNMSParameters param, c
             }
         }
 
-        topIndexData[topIdx] = selectedIdx;
-        topAnchorsData[topIdx] = anchorIdx;
-        topScoresData[topIdx] = score;
-        topClassData[topIdx] = classIdx;
+        topIndexData[topIdx] = selectedIdx; ///< 输出缓冲区索引
+        topAnchorsData[topIdx] = anchorIdx; ///< 目标狂索引
+        topScoresData[topIdx] = score;      ///< 优化后的分数
+        topClassData[topIdx] = classIdx;    ///< 类别索引
     }
 }
 
@@ -467,11 +473,26 @@ __global__ void EfficientRotatedNMSDenseIndex(EfficientRotatedNMSParameters para
     }
 }
 
+/// @brief 筛选出符合阈值要求的候选框，并为后续排序和NMS准备数据
+/// @tparam T 
+/// @param param 参数列表
+/// @param scoresInput 原始 scores 数据
+/// @param topNumData 每个样本保留的候选框数量
+/// @param topIndexData 保留候选框的索引
+/// @param topAnchorsData 保留候选框对应的锚点索引
+/// @param topOffsetsStartData 分段排序的起始索引
+/// @param topOffsetsEndData 分段排序的结束索引
+/// @param topScoresData 过滤后的得分
+/// @param topClassData 候选框类别ID
+/// @param stream 
+/// @return 
 template <typename T>
 cudaError_t EfficientRotatedNMSFilterLauncher(EfficientRotatedNMSParameters& param, const T* scoresInput, int* topNumData,
     int* topIndexData, int* topAnchorsData, int* topOffsetsStartData, int* topOffsetsEndData, T* topScoresData,
     int* topClassData, cudaStream_t stream)
 {
+    /// X 维度：按候选框元素并行 每块 512 个元素
+    /// Y 维度：按图像批次并行 每块 1 个样本
     const unsigned int elementsPerBlock = 512;
     const unsigned int imagesPerBlock = 1;
     const unsigned int elementBlocks = (param.numScoreElements + elementsPerBlock - 1) / elementsPerBlock;
@@ -479,6 +500,7 @@ cudaError_t EfficientRotatedNMSFilterLauncher(EfficientRotatedNMSParameters& par
     const dim3 blockSize = {elementsPerBlock, imagesPerBlock, 1};
     const dim3 gridSize = {elementBlocks, imageBlocks, 1};
 
+    /// 将阈值反向计算得到 Logit 空间（Sigmoid 反函数）
     float kernelSelectThreshold = 0.007f;
     if (param.scoreSigmoid)
     {
@@ -496,17 +518,26 @@ cudaError_t EfficientRotatedNMSFilterLauncher(EfficientRotatedNMSParameters& par
         param.scoreBits = -1;
     }
 
+    /// 根据阈值选择高效执行路径
     if (param.scoreThreshold < kernelSelectThreshold)
     {
+        /**
+         * 低阈值路径，保留大部分候选框
+         * 避免条件分支，用内存复制换取计算效率
+        */
         // A full copy of the buffer is necessary because sorting will scramble the input data otherwise.
+        /// 直接复制全部score
         PLUGIN_CHECK_CUDA(cudaMemcpyAsync(topScoresData, scoresInput,
             param.batchSize * param.numScoreElements * sizeof(T), cudaMemcpyDeviceToDevice, stream));
-
+        /// 生成密集索引
         EfficientRotatedNMSDenseIndex<T><<<gridSize, blockSize, 0, stream>>>(param, topNumData, topIndexData, topAnchorsData,
             topOffsetsStartData, topOffsetsEndData, topScoresData, topClassData);
     }
     else
     {
+        /**
+         * 通过原子操作压缩有效数据，减少后续处理量
+        */
         EfficientRotatedNMSFilter<T><<<gridSize, blockSize, 0, stream>>>(
             param, scoresInput, topNumData, topIndexData, topAnchorsData, topScoresData, topClassData);
 
@@ -582,23 +613,29 @@ pluginStatus_t EfficientRotatedNMSDispatch(EfficientRotatedNMSParameters param, 
     void* nmsClassesOutput, void* workspace, cudaStream_t stream)
 {
     // Clear Outputs (not all elements will get overwritten by the kernels, so safer to clear everything out)
+    /// 1. 将所有输出缓冲区初始化为0，确保未处理的元素不会残留无效数据
     CSC(cudaMemsetAsync(numDetectionsOutput, 0x00, param.batchSize * sizeof(int), stream), STATUS_FAILURE);
     CSC(cudaMemsetAsync(nmsScoresOutput, 0x00, param.batchSize * param.numOutputBoxes * sizeof(T), stream), STATUS_FAILURE);
     CSC(cudaMemsetAsync(nmsBoxesOutput, 0x00, param.batchSize * param.numOutputBoxes * 5 * sizeof(T), stream), STATUS_FAILURE);
     CSC(cudaMemsetAsync(nmsClassesOutput, 0x00, param.batchSize * param.numOutputBoxes * sizeof(int), stream), STATUS_FAILURE);
 
     // Empty Inputs
+    /// 2. 若输入得分元素数量为0（无有效检测），直接返回成功
     if (param.numScoreElements < 1)
     {
         return STATUS_SUCCESS;
     }
 
     // Counters Workspace
-    size_t workspaceOffset = 0;
+    /// 3. 分配临时内存用于中间计算结果
+    size_t workspaceOffset = 0; ///< 计算workspace后，offset会移动
     int countersTotalSize = (3 + 1 + param.numClasses) * param.batchSize;
+    /// 每个batch保留的检测框数量
     int* topNumData = EfficientRotatedNMSWorkspace<int>(workspace, workspaceOffset, countersTotalSize);
+    /// 记录每个batch在排序后的起始和结束索引
     int* topOffsetsStartData = topNumData + param.batchSize;
     int* topOffsetsEndData = topNumData + 2 * param.batchSize;
+    /// 存储最终输出的索引和类别信息
     int* outputIndexData = topNumData + 3 * param.batchSize;
     int* outputClassData = topNumData + 4 * param.batchSize;
     CSC(cudaMemsetAsync(topNumData, 0x00, countersTotalSize * sizeof(int), stream), STATUS_FAILURE);
@@ -606,6 +643,7 @@ pluginStatus_t EfficientRotatedNMSDispatch(EfficientRotatedNMSParameters param, 
     CSC(status, STATUS_FAILURE);
 
     // Other Buffers Workspace
+    /// 4. 分配排序与过滤缓冲区
     int* topIndexData
         = EfficientRotatedNMSWorkspace<int>(workspace, workspaceOffset, param.batchSize * param.numScoreElements);
     int* topClassData
@@ -622,16 +660,20 @@ pluginStatus_t EfficientRotatedNMSDispatch(EfficientRotatedNMSParameters param, 
     cub::DoubleBuffer<T> scoresDB(topScoresData, sortedScoresData);
     cub::DoubleBuffer<int> indexDB(topIndexData, sortedIndexData);
 
-    // Kernels
+    // Kernels 核心处理流程
+
+    /// 5.1 过滤低分候选框
     status = EfficientRotatedNMSFilterLauncher<T>(param, (T*) scoresInput, topNumData, topIndexData, topAnchorsData,
         topOffsetsStartData, topOffsetsEndData, topScoresData, topClassData, stream);
     CSC(status, STATUS_FAILURE);
-
+    
+    /// 5.2 分段排序
     status = cub::DeviceSegmentedRadixSort::SortPairsDescending(sortedWorkspaceData, sortedWorkspaceSize, scoresDB,
         indexDB, param.batchSize * param.numScoreElements, param.batchSize, topOffsetsStartData, topOffsetsEndData,
         param.scoreBits > 0 ? (10 - param.scoreBits) : 0, param.scoreBits > 0 ? 10 : sizeof(T) * 8, stream);
     CSC(status, STATUS_FAILURE);
 
+    /// 5.3 执行旋转NMS
     status = EfficientRotatedNMSLauncher<T>(param, topNumData, outputIndexData, outputClassData, indexDB.Current(),
         scoresDB.Current(), topClassData, topAnchorsData, boxesInput, anchorsInput, (int*) numDetectionsOutput,
         (T*) nmsScoresOutput, (int*) nmsClassesOutput, nmsBoxesOutput, stream);
@@ -646,12 +688,14 @@ pluginStatus_t EfficientRotatedNMSInference(EfficientRotatedNMSParameters param,
 {
     if (param.datatype == DataType::kFLOAT)
     {
+        /// FP32 通用推理
         param.scoreBits = -1;
         return EfficientRotatedNMSDispatch<float>(param, boxesInput, scoresInput, anchorsInput, numDetectionsOutput,
             nmsBoxesOutput, nmsScoresOutput, nmsClassesOutput, workspace, stream);
     }
     else if (param.datatype == DataType::kHALF)
     {
+        /// FP16 推理
         if (param.scoreBits <= 0 || param.scoreBits > 10)
         {
             param.scoreBits = -1;

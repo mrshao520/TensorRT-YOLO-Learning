@@ -47,6 +47,7 @@ TRTManager::TRTManager() : context_(nullptr), engine_(nullptr), runtime_(nullptr
 void TRTManager::initialize(void const* blob, std::size_t size) {
     logger_ = std::make_unique<TRTLogger>(nvinfer1::ILogger::Severity::kWARNING);
 
+    /// 调用 registerCreator 在插件注册表上进行动态注册
     initLibNvInferPlugins(logger_.get(), "");
 
     // 创建 TensorRT runtime

@@ -386,6 +386,7 @@ __global__ void EfficientNMSFilter(EfficientIdxNMSParameters param, const T* __r
         }
 
         // Use an atomic to find an open slot where to write the selected anchor data.
+        /// 当前批次的
         if (topNumData[imageIdx] >= param.numScoreElements)
         {
             return;
