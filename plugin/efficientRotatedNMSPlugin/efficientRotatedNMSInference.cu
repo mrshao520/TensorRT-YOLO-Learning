@@ -142,39 +142,47 @@ __global__ void EfficientRotatedNMS(EfficientRotatedNMSParameters param, const i
     const Tb* __restrict__ anchorsInput, int* __restrict__ numDetectionsOutput, T* __restrict__ nmsScoresOutput,
     int* __restrict__ nmsClassesOutput, RotatedBoxCorner<T>* __restrict__ nmsBoxesOutput)
 {
-    unsigned int thread = threadIdx.x;
-    unsigned int imageIdx = blockIdx.y;
-    unsigned int tileSize = blockDim.x;
+    unsigned int thread = threadIdx.x;  ///< 线程 id
+    unsigned int imageIdx = blockIdx.y; ///< 图像批次索引
+    unsigned int tileSize = blockDim.x; ///< 线程块大小
+
+    /// 检查图像索引有效性
     if (imageIdx >= param.batchSize)
     {
         return;
     }
 
+    /// 确定实际处理的候选框数量
     int numSelectedBoxes = min(topNumData[imageIdx], param.numSelectedBoxes);
+    /// 计算需要的分块数
     int numTiles = (numSelectedBoxes + tileSize - 1) / tileSize;
+    /// 检查线程有效性
     if (thread >= numSelectedBoxes)
     {
         return;
     }
 
-    __shared__ int blockState;
-    __shared__ unsigned int resultsCounter;
+    __shared__ int blockState; ///< 块状态（线程间通信）
+    __shared__ unsigned int resultsCounter; ///< 结果计数器
     if (thread == 0)
     {
-        blockState = 0;
-        resultsCounter = 0;
+        blockState = 0; ///< 初始状态; 0=正常
+        resultsCounter = 0; ///< 结果计数清零
     }
 
-    int threadState[NMS_TILES];
-    unsigned int boxIdx[NMS_TILES];
-    T threadScore[NMS_TILES];
-    int threadClass[NMS_TILES];
-    RotatedBoxCorner<T> threadBox[NMS_TILES];
-    int boxIdxMap[NMS_TILES];
+    int threadState[NMS_TILES]; ///< 框状态
+    unsigned int boxIdx[NMS_TILES]; ///< 框全局索引
+    T threadScore[NMS_TILES]; ///< 框得分
+    int threadClass[NMS_TILES]; ///< 框类别
+    RotatedBoxCorner<T> threadBox[NMS_TILES]; ///< 旋转框索引
+    int boxIdxMap[NMS_TILES]; ///< 框映射索引
+
+    /// 初始化并加载数据
     for (int tile = 0; tile < numTiles; tile++)
     {
-        threadState[tile] = 0;
-        boxIdx[tile] = thread + tile * blockDim.x;
+        threadState[tile] = 0; ///< 初始状态
+        boxIdx[tile] = thread + tile * blockDim.x; ///< 计算全局索引
+        /// 加载框数据到线程私有存储
         MapRotatedNMSData<T, Tb>(param, boxIdx[tile], imageIdx, boxesInput, anchorsInput, topClassData, topAnchorsData,
             topNumData, sortedScoresData, sortedIndexData, threadScore[tile], threadClass[tile], threadBox[tile],
             boxIdxMap[tile]);
@@ -183,8 +191,8 @@ __global__ void EfficientRotatedNMS(EfficientRotatedNMSParameters param, const i
     // Iterate through all boxes to NMS against.
     for (int i = 0; i < numSelectedBoxes; i++)
     {
-        int tile = i / tileSize;
-
+        int tile = i / tileSize; /// 当前框所属分块
+        
         if (boxIdx[tile] == i)
         {
             // Iteration lead thread, figure out what the other threads should do,
@@ -195,6 +203,7 @@ __global__ void EfficientRotatedNMS(EfficientRotatedNMSParameters param, const i
                 // because it had a large IOU overlap with another lead thread previously, so
                 // it would never be kept anyway, therefore it can safely be skip all IOU operations
                 // in this iteration.
+                /// 状态：跳过迭代，框已被丢弃
                 blockState = -1; // -1 => Signal all threads to skip iteration
             }
             else if (threadState[tile] == 0)
@@ -203,6 +212,7 @@ __global__ void EfficientRotatedNMS(EfficientRotatedNMSParameters param, const i
                 // should have, as this allows to perform an early loop exit if there are enough results.
                 if (resultsCounter >= param.numOutputBoxes)
                 {
+                    /// 状态：提前退出，结果数已达上限
                     blockState = -2; // -2 => Signal all threads to do an early loop exit.
                 }
                 else
@@ -246,13 +256,13 @@ __global__ void EfficientRotatedNMS(EfficientRotatedNMSParameters param, const i
         if (blockState == -2)
         {
             // This is the signal to exit from the loop.
-            return;
+            return; ///< 提取推出
         }
 
         if (blockState == -1)
         {
             // This is the signal for all threads to just skip this iteration, as no IOU's need to be checked.
-            continue;
+            continue; ///< 跳过本次迭代
         }
 
         // Grab a box and class to test the current box against. The test box corresponds to iteration i,
@@ -262,6 +272,8 @@ __global__ void EfficientRotatedNMS(EfficientRotatedNMSParameters param, const i
         int testClass;
         RotatedBoxCorner<T> testBox;
         int testBoxIdxMap;
+
+        /// 获取测试框数据
         MapRotatedNMSData<T, Tb>(param, i, imageIdx, boxesInput, anchorsInput, topClassData, topAnchorsData, topNumData,
             sortedScoresData, sortedIndexData, testScore, testClass, testBox, testBoxIdxMap);
 
@@ -274,13 +286,13 @@ __global__ void EfficientRotatedNMS(EfficientRotatedNMSParameters param, const i
             }
 
             // IOU
-            if (boxIdx[tile] > i && // Make sure two different boxes are being tested, and that it's a higher index;
-                boxIdx[tile] < numSelectedBoxes && // Make sure the box is within numSelectedBoxes;
-                blockState == 1 &&                 // Signal that allows IOU checks to be performed;
-                threadState[tile] == 0 &&          // Make sure this box hasn't been either dropped or kept already;
-                ignoreClass &&                     // Compare only boxes of matching classes when classAgnostic is false;
-                lte_mp(threadScore[tile], testScore) && // Make sure the sorting order of scores is as expected;
-                IOU<T>(param, threadBox[tile], testBox) >= param.iouThreshold) // And... IOU overlap.
+            if (boxIdx[tile] > i && // 只处理索引更大的框 Make sure two different boxes are being tested, and that it's a higher index;
+                boxIdx[tile] < numSelectedBoxes && // 索引有效 Make sure the box is within numSelectedBoxes;
+                blockState == 1 &&                 // 状态允许计算 Signal that allows IOU checks to be performed;
+                threadState[tile] == 0 &&          // 框状态为待处理 Make sure this box hasn't been either dropped or kept already;
+                ignoreClass &&                     // 类别无关 Compare only boxes of matching classes when classAgnostic is false;
+                lte_mp(threadScore[tile], testScore) && // 得分排序 Make sure the sorting order of scores is as expected;
+                IOU<T>(param, threadBox[tile], testBox) >= param.iouThreshold) // IOU阈值判断 And... IOU overlap.
             {
                 // Current box overlaps with the box tested in this iteration, this box will be skipped.
                 threadState[tile] = -1; // -1 => Mark this box's thread to be dropped.
@@ -295,6 +307,7 @@ cudaError_t EfficientRotatedNMSLauncher(EfficientRotatedNMSParameters& param, in
     const void* boxesInput, const void* anchorsInput, int* numDetectionsOutput, T* nmsScoresOutput,
     int* nmsClassesOutput, void* nmsBoxesOutput, cudaStream_t stream)
 {
+    /// 根据候选框数量调整线程块大小，优化并行效率
     unsigned int tileSize = param.numSelectedBoxes / NMS_TILES;
     if (param.numSelectedBoxes <= 512)
     {
@@ -305,11 +318,13 @@ cudaError_t EfficientRotatedNMSLauncher(EfficientRotatedNMSParameters& param, in
         tileSize = 256;
     }
 
-    const dim3 blockSize = {tileSize, 1, 1};
-    const dim3 gridSize = {1, (unsigned int) param.batchSize, 1};
+    /// 每个线程块处理一个图像样本
+    const dim3 blockSize = {tileSize, 1, 1};  ///< 一维线程块
+    const dim3 gridSize = {1, (unsigned int) param.batchSize, 1}; ///< 二维网格
 
     if (param.boxCoding == 0)
     {
+        /// 角点编码：x1 y1 x2 y2 r
         EfficientRotatedNMS<T, RotatedBoxCorner<T>><<<gridSize, blockSize, 0, stream>>>(param, topNumData, outputIndexData,
             outputClassData, sortedIndexData, sortedScoresData, topClassData, topAnchorsData,
             (RotatedBoxCorner<T>*) boxesInput, (RotatedBoxCorner<T>*) anchorsInput, numDetectionsOutput, nmsScoresOutput,
@@ -317,6 +332,7 @@ cudaError_t EfficientRotatedNMSLauncher(EfficientRotatedNMSParameters& param, in
     }
     else if (param.boxCoding == 1)
     {
+        /// 中心编码：x y w h r
         // Note that nmsBoxesOutput is always coded as RotatedBoxCorner<T>, regardless of the input coding type.
         EfficientRotatedNMS<T, RotatedBoxCenterSize<T>><<<gridSize, blockSize, 0, stream>>>(param, topNumData, outputIndexData,
             outputClassData, sortedIndexData, sortedScoresData, topClassData, topAnchorsData,
@@ -330,12 +346,15 @@ cudaError_t EfficientRotatedNMSLauncher(EfficientRotatedNMSParameters& param, in
 __global__ void EfficientRotatedNMSFilterSegments(EfficientRotatedNMSParameters param, const int* __restrict__ topNumData,
     int* __restrict__ topOffsetsStartData, int* __restrict__ topOffsetsEndData)
 {
+    /// 每个线程处理一个图像样本 <<<1, param.batchSize, 0, stream>>>
     int imageIdx = threadIdx.x;
     if (imageIdx > param.batchSize)
     {
         return;
     }
+    /// 当前图像在全局数组中的起始索引 图像索引*最大候选框数
     topOffsetsStartData[imageIdx] = imageIdx * param.numScoreElements;
+    /// 当前图像在全局数组中的结束索引 起始索引+当前图像实际候选框数
     topOffsetsEndData[imageIdx] = imageIdx * param.numScoreElements + topNumData[imageIdx];
 }
 
@@ -535,12 +554,11 @@ cudaError_t EfficientRotatedNMSFilterLauncher(EfficientRotatedNMSParameters& par
     }
     else
     {
-        /**
-         * 通过原子操作压缩有效数据，减少后续处理量
-        */
+        /// 通过原子操作压缩有效数据，减少后续处理量
         EfficientRotatedNMSFilter<T><<<gridSize, blockSize, 0, stream>>>(
             param, scoresInput, topNumData, topIndexData, topAnchorsData, topScoresData, topClassData);
 
+        /// 计算每个图像（在批次中）在过滤后的候选框的起始和结束偏移量
         EfficientRotatedNMSFilterSegments<<<1, param.batchSize, 0, stream>>>(
             param, topNumData, topOffsetsStartData, topOffsetsEndData);
     }
